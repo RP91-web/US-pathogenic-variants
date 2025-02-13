@@ -1,0 +1,953 @@
+library(caret)
+library(dplyr)
+library(corrplot)
+library(glmnet)
+library(boot)
+library(randomForest)
+library(class)
+library(kernlab)
+library(pROC)
+library(gbm)
+
+set.seed(665)
+
+#Import data
+db_full <- read.csv("Replace with database address")
+
+#Split databases in tumor only and tumor+peritumoral
+db_tumor <- subset(db_full, segment == "t")
+db_tumorPeri <- subset(db_full, segment == "t+p")
+
+#Tumor presence/absence (Mutatie_patogena_prezenta) and KI67.cutoff as factors
+db_tumor$id <- as.factor(db_tumor$id)
+db_tumorPeri$id <- as.factor(db_tumorPeri$id)
+db_tumor$Mutatie_patogena_prezenta <- as.factor(db_tumor$Mutatie_patogena_prezenta)
+db_tumorPeri$Mutatie_patogena_prezenta <- as.factor(db_tumorPeri$Mutatie_patogena_prezenta)
+db_tumor$KI67.cutoff <- as.factor(db_tumor$KI67.cutoff)
+db_tumorPeri$KI67.cutoff <- as.factor(db_tumorPeri$KI67.cutoff)
+
+str(db_tumor)
+str(db_tumorPeri)
+
+#Standardizing imaging (eco) variables and KI67.valoare (proliferation index)
+Zdb_tumor <- db_tumor %>% mutate(across(14:323, ~ as.numeric(scale(.))))
+Zdb_tumorPeri <- db_tumorPeri %>% mutate(across(14:323, ~ as.numeric(scale(.))))
+
+###########################################################################
+#Running Mann-Whitney test with Benjamini-Hochberg correction (Tumor data)#
+###########################################################################
+# Define the function to perform Mann-Whitney test and p-value adjustment
+perform_mann_whitney <- function(df, dependent_vars, group_var, keep_vars) {
+  # Perform Mann-Whitney tests for each dependent variable
+  p_values <- sapply(dependent_vars, function(var) {
+    tryCatch({
+      wilcox.test(df[[var]] ~ df[[group_var]])$p.value
+    }, error = function(e) {
+      NA  # Return NA if an error occurs for any variable
+    })
+  })
+  
+  # Apply Benjamini-Hochberg correction
+  p_adj <- p.adjust(p_values, method = "BH")
+  
+  # Create a results data frame
+  results <- data.frame(Variable = dependent_vars, P_Value = p_values, P_Adj = p_adj)
+  
+  # Get names of significant variables (p_adj < 0.051)
+  significant_vars <- results %>% filter(P_Adj < 0.051) %>% pull(Variable)
+  
+  # Filter the data to keep only the significant variables
+  df_filtered <- df %>% select(all_of(keep_vars), all_of(significant_vars))
+  
+  # Return filtered dataframe and significant variables
+  return(list(filtered_data = df_filtered, significant_vars = significant_vars))
+}
+
+# Define variable selection and analysis for Zdb_Tumor
+group_var_tumor <- "Mutatie_patogena_prezenta"  # Grouping variable for Zdb_Tumor
+keep_vars_tumor <- c("id", "segment", "Varsta", "tip.histologic", "Grad", "ER", "PR", "KI67.valoare", 
+                     "KI67.cutoff", "HER2", "Dimensiune.tumora", "Mutatie_patogena_prezenta", 
+                     "Mutatie_specifica", group_var_tumor)  # Columns to keep for Zdb_Tumor
+
+dependent_vars_tumor <- 14:323  # Dependent variables for Zdb_Tumor
+
+# Perform Mann-Whitney test on Zdb_Tumor
+result_tumor <- perform_mann_whitney(Zdb_tumor, dependent_vars_tumor, group_var_tumor, keep_vars_tumor)
+
+# Access filtered data and significant variables for Zdb_Tumor
+df_filtered_tumor <- result_tumor$filtered_data
+significant_vars_tumor <- result_tumor$significant_vars
+
+# Define variable selection and analysis for Zdb_TumorPeri
+group_var_peri <- "Mutatie_patogena_prezenta"  # Grouping variable for Zdb_TumorPeri
+keep_vars_peri <- c("id", "segment", "Varsta", "tip.histologic", "Grad", "ER", "PR", "KI67.valoare", 
+                    "KI67.cutoff", "HER2", "Dimensiune.tumora", "Mutatie_patogena_prezenta", 
+                    "Mutatie_specifica", group_var_peri)  # Columns to keep for Zdb_TumorPeri
+
+dependent_vars_peri <- 14:323  # Dependent variables for Zdb_TumorPeri
+
+# Perform Mann-Whitney test on Zdb_TumorPeri
+result_peri <- perform_mann_whitney(Zdb_tumorPeri, dependent_vars_peri, group_var_peri, keep_vars_peri)
+
+# Access filtered data and significant variables for Zdb_TumorPeri
+df_filtered_peri <- result_peri$filtered_data
+significant_vars_peri <- result_peri$significant_vars
+
+# Check the filtered data for both datasets
+print(df_filtered_tumor)
+print(df_filtered_peri)
+
+#Rename outputted dataframes, MW = Mann-Whitney
+Zdb_tumorMW <- df_filtered_tumor
+Zdb_tumorPeriMW <- df_filtered_peri
+
+View(Zdb_tumorMW)
+View(Zdb_tumorPeriMW)
+
+#############################################
+#Feature reduction/selection via correlation#
+#############################################
+# Define the function to perform the analysis on each dataset
+perform_analysis <- function(df, start_col, end_col, keep_vars) {
+  # Select only the numeric variables from a specific range (columns 14 to 123 in this case)
+  numeric_vars_range <- df[, start_col:end_col]
+  
+  # Remove rows with missing values in the numeric variables range
+  numeric_vars_range <- na.omit(numeric_vars_range)
+  
+  # Create a correlation matrix for the selected numeric variables
+  cor_matrix <- cor(numeric_vars_range, method = "spearman")
+  
+  # View the correlation matrix
+  View(cor_matrix)
+  
+  # Plot the correlation matrix using corrplot
+  corrplot(cor_matrix, tl.cex = 0.5)
+  
+  # Find redundant variables with high correlations (correlation > 0.90)
+  redundant_vars <- findCorrelation(cor_matrix, cutoff = 0.90, names = TRUE)
+  
+  # Display redundant variables
+  print(redundant_vars)
+  
+  # Remove the redundant variables from the selected numeric variables
+  selected_vars <- setdiff(names(numeric_vars_range), redundant_vars)
+  
+  # Create a new dataset with the selected features (including the non-numeric variables)
+  new_dataset <- df %>% select(all_of(keep_vars), all_of(selected_vars))
+  
+  # Return the new dataset with selected features
+  return(new_dataset)
+}
+
+# Keep variables that are non-numeric (e.g., "id", "segment", etc.)
+keep_vars <- c("id", "segment", "Varsta", "tip.histologic", "Grad", "ER", "PR", "KI67.valoare", 
+               "KI67.cutoff", "HER2", "Dimensiune.tumora", "Mutatie_patogena_prezenta", "Mutatie_specifica")
+
+# Perform the analysis on Zdb_tumorMW (Columns 14 to 123)
+new_dataset_tumorMW <- perform_analysis(Zdb_tumorMW, 14, 261, keep_vars)
+
+# Perform the analysis on Zdb_tumorPeriMW (Columns 14 to 123)
+new_dataset_tumorPeriMW <- perform_analysis(Zdb_tumorPeriMW, 14, 93, keep_vars)
+
+# Rename the new datasets
+tumorCorr <- new_dataset_tumorMW
+tumorPeriCorr <- new_dataset_tumorPeriMW
+
+View(tumorCorr)
+View(tumorPeriCorr)
+
+
+#####################################################
+#Feature selection via multivariate LASSO regression
+#####################################################
+
+############################
+#Feature selection for Tumor
+############################
+
+xfactors_tumorCorr <- model.matrix(Mutatie_patogena_prezenta ~ Perc.01. + X.S.0.1.Contrast + X.S.2.2.AngScMom + X.S.5..5.SumVarnc + Vertl_LngREmph 
+                                   + X135dr_GLevNonU + Teta2 + WavEnHH_s.1 + WavEnLL_s.6 + WavEnLH_s.6, 
+                                   data = tumorCorr)
+
+#Remove missing cases, this creates a mismatch between number of observations in y_tumorCorr (88) and the number of rows in x_tumorCorr (86)
+tumorCorr <- tumorCorr[complete.cases(tumorCorr), ]
+
+x_tumorCorr <- as.matrix(data.frame(xfactors_tumorCorr))
+y_tumorCorr <- tumorCorr$Mutatie_patogena_prezenta
+
+# Note alpha=1 for lasso only and can blend with ridge penalty down to
+# alpha=0 ridge only.
+glmmod_tumorCorr <- glmnet(x_tumorCorr, y_tumorCorr, alpha=1, family="binomial")
+
+# Plot variable coefficients vs. shrinkage parameter lambda.
+plot(glmmod_tumorCorr, xvar="lambda", label = TRUE)
+
+cv.glmmod_tumorCorr <- cv.glmnet(x_tumorCorr, y_tumorCorr, alpha=1, family="binomial")
+plot(cv.glmmod_tumorCorr)
+
+best_lambda_tumorCorr <- cv.glmmod_tumorCorr$lambda.min
+best_lambda_tumorCorr
+
+best_model_tumorCorr <- glmnet(x_tumorCorr, y_tumorCorr, family="binomial", alpha=1, lambda=best_lambda_tumorCorr)
+coef(best_model_tumorCorr)
+
+##########################################
+#Feature selection for Tumor + Peritumoral
+##########################################
+
+xfactors_tumorPeriCorr <- model.matrix(Mutatie_patogena_prezenta ~ Kurtosis + Perc.01. + X.S.1.0.AngScMom + X.S.1..1.AngScMom
+                                       + X.S.2.0.AngScMom + X.S.3.0.AngScMom + X.S.3..3.SumAverg
+                                       + X.S.5..5.AngScMom + X.S.5..5.SumEntrp + Horzl_RLNonUni
+                                       + WavEnHH_s.1 + WavEnHL_s.3 + WavEnHL_s.4 + WavEnHL_s.5 + WavEnHH_s.6,
+                                       data = tumorPeriCorr)
+
+#Remove missing cases, this creates a mismatch between number of observations in y_tumorCorr (88) and the number of rows in x_tumorCorr (86)
+#tumorPeriCorr <- tumorPeriCorr[complete.cases(tumorPeriCorr), ]
+#Here there is no need, since there are no missing cases
+
+x_tumorPeriCorr <- as.matrix(data.frame(xfactors_tumorPeriCorr))
+y_tumorPeriCorr <- tumorPeriCorr$Mutatie_patogena_prezenta
+
+# Note alpha=1 for lasso only and can blend with ridge penalty down to
+# alpha=0 ridge only.
+glmmod_tumorPeriCorr <- glmnet(x_tumorPeriCorr, y_tumorPeriCorr, alpha=1, family="binomial")
+
+# Plot variable coefficients vs. shrinkage parameter lambda.
+plot(glmmod_tumorPeriCorr, xvar="lambda", label = TRUE)
+
+cv.glmmod_tumorPeriCorr <- cv.glmnet(x_tumorPeriCorr, y_tumorPeriCorr, alpha=1, family="binomial")
+plot(cv.glmmod_tumorPeriCorr)
+
+best_lambda_tumorPeriCorr <- cv.glmmod_tumorPeriCorr$lambda.min
+best_lambda_tumorPeriCorr
+
+best_model_tumorPeriCorr <- glmnet(x_tumorPeriCorr, y_tumorPeriCorr, family="binomial", alpha=1, lambda=best_lambda_tumorPeriCorr)
+coef(best_model_tumorPeriCorr)
+
+#Calculate RadScore1(tumor features) and RadScore2(tumor+peritumoral features)
+#Formula: RadScore = (lasso_coeff_feature_1 * feature_1) + [...] + (lasso_coeff_feature_N * feature_N)
+#Calculated for the non-zero features remaining after feature reduction via multivariate LASSO regression
+tumorCorr$RadScore1 <- (0.11682188 * tumorCorr$`X.S.0.1.Contrast`) + 
+                      (0.94861884 * tumorCorr$`X.S.2.2.AngScMom`) + 
+                      (-0.01382571 * tumorCorr$`X.S.5..5.SumVarnc`) + 
+                      (-0.49217048 * tumorCorr$`X135dr_GLevNonU`) +
+                      (-0.29472012 * tumorCorr$`Teta2`) + 
+                      (-0.73954903 * tumorCorr$`WavEnLL_s.6`) + 
+                      (-0.32624054 * tumorCorr$`WavEnLH_s.6`)
+
+head(tumorCorr$RadScore1)
+
+tumorPeriCorr$RadScore2 <- (-0.59742319 * tumorPeriCorr$`Perc.01.`) + 
+                          (-0.31245279 * tumorPeriCorr$`X.S.5..5.SumEntrp`) + 
+                          (-0.03051554 * tumorPeriCorr$`Horzl_RLNonUni`) + 
+                          (-0.38319026 * tumorPeriCorr$`WavEnHL_s.3`) + 
+                          (-0.04487077 * tumorPeriCorr$`WavEnHH_s.6`)
+
+head(tumorPeriCorr$RadScore2)
+
+
+#################################################################################
+#@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@#
+#Machine Learning Section // Machine Learning Section // Machine Learning Section
+#@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@#
+#################################################################################
+
+#Standardizing KI67.valoare (proliferation index)
+tumorCorr$KI67.valoare <- as.numeric(scale(tumorCorr$KI67.valoare))
+tumorPeriCorr$KI67.valoare <- as.numeric(scale(tumorPeriCorr$KI67.valoare))
+
+summary(tumorCorr)
+summary(tumorPeriCorr)
+str(tumorCorr)
+str(tumorPeriCorr)
+
+#Telling R that in fact "1" represents the positive class (mutation present), because the default uses "0" as the positive class
+#tumorCorr$Mutatie_patogena_prezenta <- factor(tumorCorr$Mutatie_patogena_prezenta, levels = c(1, 0))
+#tumorPeriCorr$Mutatie_patogena_prezenta <- factor(tumorPeriCorr$Mutatie_patogena_prezenta, levels = c(1, 0))
+
+
+###################################################################################################
+#Split Data into Training (75%) and Testing (25%)
+#Formula derived from:
+#Joseph, V. R. (2022). Optimal ratio for data splitting. Statistical Analysis and Data Mining, 15(4), 531–538. doi:10.1002/sam.11583
+# Recommended ratio is sqrt(p):1, where p = no. of free parameters
+#We used p = sqrt(N)n where N is the number of unique rows in the input matrix of the dataset
+#So, for tumorCorr this would be sqrt(86) = 9.27. 
+#Thus, the splitting ratio is sqrt(9.27):1 = ~3:1 (75% and 25%)
+#For tumorPeriCorr this would be sqrt(88) = 9.38
+#Thus, the splitting ratio is sqrt(9.38):1 = ~3:1 (75% and 25%)
+###################################################################################################
+
+# Function to split data into 75% training and 25% testing
+split_data <- function(data) {
+  train_index <- createDataPartition(data$Mutatie_patogena_prezenta, p = 0.75, list = FALSE)
+  train_set <- data[train_index, ]
+  test_set <- data[-train_index, ]
+  return(list(train = train_set, test = test_set))
+}
+
+# Split tumorCorr
+split_tumorCorr <- split_data(tumorCorr)
+train_tumorCorr <- split_tumorCorr$train
+test_tumorCorr <- split_tumorCorr$test
+
+# Split tumorPeriCorr
+split_tumorPeriCorr <- split_data(tumorPeriCorr)
+train_tumorPeriCorr <- split_tumorPeriCorr$train
+test_tumorPeriCorr <- split_tumorPeriCorr$test
+
+##############################################################################################
+
+# ----------------------------------
+# Train Random Forest for tumorCorr
+# ----------------------------------
+
+##############################################################################################
+rf_model_tumorCorr <- train(
+  Mutatie_patogena_prezenta ~ RadScore1 + KI67.valoare, 
+  data = train_tumorCorr, 
+  method = "rf",
+  trControl = trainControl(method = "none"),
+  metric = "Accuracy"
+)
+
+# Predictions on test set
+rf_pred_tumorCorr <- predict(rf_model_tumorCorr, test_tumorCorr)
+rf_prob_tumorCorr <- predict(rf_model_tumorCorr, test_tumorCorr, type = "prob")[,2]
+
+# Confusion matrix and performance metrics
+conf_matrix_tumorCorr <- confusionMatrix(rf_pred_tumorCorr, test_tumorCorr$Mutatie_patogena_prezenta, positive = "1")
+print(conf_matrix_tumorCorr)
+
+# Compute AUC and plot ROC
+roc_tumorCorr <- roc(test_tumorCorr$Mutatie_patogena_prezenta, rf_prob_tumorCorr)
+auc_tumorCorr <- auc(roc_tumorCorr)
+print(paste("AUC - tumorCorr:", auc_tumorCorr))
+
+# Plot ROC curve
+plot(roc_tumorCorr, col = "red", main = "ROC Curve - Random Forest Classifier", legacy.axes = "TRUE")
+
+# ----------------------------------
+# Compute Baseline AUC
+# ----------------------------------
+rf_prob_tumorCorr <- predict(rf_model_tumorCorr, test_tumorCorr, type = "prob")[,2]
+roc_original <- roc(test_tumorCorr$Mutatie_patogena_prezenta, rf_prob_tumorCorr)
+auc_original <- auc(roc_original)
+
+# ----------------------------------
+# Compute Mean Dropout Loss (1 - AUC)
+# ----------------------------------
+features <- c("RadScore1", "KI67.valoare")
+mdl_values <- numeric(length(features))
+
+for (i in seq_along(features)) {
+  test_shuffled <- test_tumorCorr
+  test_shuffled[[features[i]]] <- sample(test_shuffled[[features[i]]])  # Shuffle feature
+  
+  rf_prob_shuffled <- predict(rf_model_tumorCorr, test_shuffled, type = "prob")[,2]
+  roc_shuffled <- roc(test_tumorCorr$Mutatie_patogena_prezenta, rf_prob_shuffled)
+  auc_shuffled <- auc(roc_shuffled)
+  
+  mdl_values[i] <- 1 - (auc_shuffled / auc_original)  # Compute MDL
+}
+
+# ----------------------------------
+# Print and Plot MDL (1 - AUC)
+# ----------------------------------
+mdl_results <- data.frame(Feature = features, MDL = mdl_values)
+print("Mean Dropout Loss (MDL) - 1 - AUC:")
+print(mdl_results)
+
+# Plot MDL
+library(ggplot2)
+ggplot(mdl_results, aes(x = Feature, y = MDL, fill = Feature)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Feature Importance (MDL - 1 - AUC)", y = "Mean Dropout Loss (1 - AUC)", x = "Feature") +
+  theme_minimal()
+
+##############################################################################################
+
+# --------------------------------------
+# Train Random Forest for tumorPeriCorr
+# --------------------------------------
+
+##############################################################################################
+rf_model_tumorPeriCorr <- train(
+  Mutatie_patogena_prezenta ~ RadScore2 + KI67.valoare, 
+  data = train_tumorPeriCorr, 
+  method = "rf",
+  trControl = trainControl(method = "none"),
+  metric = "Accuracy"
+)
+
+# Predictions on test set
+rf_pred_tumorPeriCorr <- predict(rf_model_tumorPeriCorr, test_tumorPeriCorr)
+rf_prob_tumorPeriCorr <- predict(rf_model_tumorPeriCorr, test_tumorPeriCorr, type = "prob")[,2]
+
+# Confusion matrix and performance metrics
+conf_matrix_tumorPeriCorr <- confusionMatrix(rf_pred_tumorPeriCorr, test_tumorPeriCorr$Mutatie_patogena_prezenta, positive = "1")
+print(conf_matrix_tumorPeriCorr)
+
+# Compute AUC and plot ROC
+roc_tumorPeriCorr <- roc(test_tumorPeriCorr$Mutatie_patogena_prezenta, rf_prob_tumorPeriCorr)
+auc_tumorPeriCorr <- auc(roc_tumorPeriCorr)
+print(paste("AUC - tumorPeriCorr:", auc_tumorPeriCorr))
+
+# Plot ROC curve
+plot(roc_tumorPeriCorr, main = "ROC Curve - Random Forest (tumorPeriCorr)", legacy.axes = "TRUE")
+
+# --------------------------------------
+# Compute Baseline AUC
+# --------------------------------------
+rf_prob_tumorPeriCorr <- predict(rf_model_tumorPeriCorr, test_tumorPeriCorr, type = "prob")[,2]
+roc_original <- roc(test_tumorPeriCorr$Mutatie_patogena_prezenta, rf_prob_tumorPeriCorr)
+auc_original <- auc(roc_original)
+
+# --------------------------------------
+# Compute Mean Dropout Loss (1 - AUC)
+# --------------------------------------
+features <- c("RadScore2", "KI67.valoare")
+mdl_values <- numeric(length(features))
+
+for (i in seq_along(features)) {
+  test_shuffled <- test_tumorPeriCorr
+  test_shuffled[[features[i]]] <- sample(test_shuffled[[features[i]]])  # Shuffle feature
+  
+  rf_prob_shuffled <- predict(rf_model_tumorPeriCorr, test_shuffled, type = "prob")[,2]
+  roc_shuffled <- roc(test_tumorPeriCorr$Mutatie_patogena_prezenta, rf_prob_shuffled)
+  auc_shuffled <- auc(roc_shuffled)
+  
+  mdl_values[i] <- 1 - (auc_shuffled / auc_original)  # Compute MDL
+}
+
+# --------------------------------------
+# Print and Plot MDL (1 - AUC)
+# --------------------------------------
+mdl_results <- data.frame(Feature = features, MDL = mdl_values)
+print("Mean Dropout Loss (MDL) - 1 - AUC:")
+print(mdl_results)
+
+# Plot MDL
+ggplot(mdl_results, aes(x = Feature, y = MDL, fill = Feature)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Feature Importance (MDL - 1 - AUC)", y = "Mean Dropout Loss (1 - AUC)", x = "Feature") +
+  theme_minimal()
+
+##############################################################################################
+
+# --------------------------------------
+# Train KNN for tumorCorr
+# --------------------------------------
+
+##############################################################################################
+
+# Train KNN model on training data
+knn_model <- train(
+  Mutatie_patogena_prezenta ~ RadScore1 + KI67.valoare, 
+  data = train_tumorCorr, 
+  method = "knn",
+  tuneLength = 10  # Tries 10 different k values to find the best one
+)
+
+# Print model results
+print(knn_model)
+
+# Best k value
+print(knn_model$bestTune)
+
+# Plot k tuning results
+plot(knn_model)
+
+# Predict on **test set**
+knn_predictions <- predict(knn_model, test_tumorCorr)
+
+# Compute confusion matrix
+conf_matrix_knn <- confusionMatrix(knn_predictions, test_tumorCorr$Mutatie_patogena_prezenta, positive = "1")
+print(conf_matrix_knn)
+
+# Get predicted probabilities for the test set
+knn_probs <- predict(knn_model, test_tumorCorr, type = "prob")
+knn_probabilities <- knn_probs[, "1"]  # Extract probabilities for class 1
+
+# Compute ROC curve & AUC
+roc_knn <- roc(test_tumorCorr$Mutatie_patogena_prezenta, knn_probabilities, levels = c("0", "1"), direction = "<")
+auc_knn <- auc(roc_knn)
+print(auc_knn)  # Print the AUC value
+
+# Plot ROC curve
+plot(roc_knn, col = "blue", lwd = 2, main = "ROC Curve - K-Nearest Neighbours Classifier", legacy.axes = "TRUE")
+
+# --------------------------------------
+# Compute Baseline AUC
+# --------------------------------------
+knn_probabilities <- predict(knn_model, test_tumorCorr, type = "prob")[, "1"]
+roc_original <- roc(test_tumorCorr$Mutatie_patogena_prezenta, knn_probabilities)
+auc_original <- auc(roc_original)
+
+# --------------------------------------
+# Compute Mean Dropout Loss (1 - AUC)
+# --------------------------------------
+features <- c("RadScore1", "KI67.valoare")
+mdl_values <- numeric(length(features))
+
+for (i in seq_along(features)) {
+  test_shuffled <- test_tumorCorr
+  test_shuffled[[features[i]]] <- sample(test_shuffled[[features[i]]])  # Shuffle feature
+  
+  knn_prob_shuffled <- predict(knn_model, test_shuffled, type = "prob")[, "1"]
+  roc_shuffled <- roc(test_tumorCorr$Mutatie_patogena_prezenta, knn_prob_shuffled)
+  auc_shuffled <- auc(roc_shuffled)
+  
+  mdl_values[i] <- 1 - (auc_shuffled / auc_original)  # Compute MDL
+}
+
+# --------------------------------------
+# Print and Plot MDL (1 - AUC)
+# --------------------------------------
+mdl_results <- data.frame(Feature = features, MDL = mdl_values)
+print("Mean Dropout Loss (MDL) - 1 - AUC:")
+print(mdl_results)
+
+# Plot MDL
+ggplot(mdl_results, aes(x = Feature, y = MDL, fill = Feature)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Feature Importance (MDL - 1 - AUC)", y = "Mean Dropout Loss (1 - AUC)", x = "Feature") +
+  theme_minimal()
+
+##############################################################################################
+
+# --------------------------------------
+# Train KNN for tumorPeriCorr
+# --------------------------------------
+
+##############################################################################################
+
+# Train KNN model on training data for tumorPeriCorr
+knn_model_tumorPeri <- train(
+  Mutatie_patogena_prezenta ~ RadScore2 + KI67.valoare, 
+  data = train_tumorPeriCorr, 
+  method = "knn",
+  tuneLength = 10  # Tries 10 different k values to find the best one
+)
+
+# Print model results
+print(knn_model_tumorPeri)
+
+# Best k value
+print(knn_model_tumorPeri$bestTune)
+
+# Plot k tuning results
+plot(knn_model_tumorPeri)
+
+# Predict on **test set**
+knn_predictions_tumorPeri <- predict(knn_model_tumorPeri, test_tumorPeriCorr)
+
+# Compute confusion matrix
+conf_matrix_knn_tumorPeri <- confusionMatrix(knn_predictions_tumorPeri, test_tumorPeriCorr$Mutatie_patogena_prezenta, positive = "1")
+print(conf_matrix_knn_tumorPeri)
+
+# Get predicted probabilities for the test set
+knn_probs_tumorPeri <- predict(knn_model_tumorPeri, test_tumorPeriCorr, type = "prob")
+knn_probabilities_tumorPeri <- knn_probs_tumorPeri[, "1"]  # Extract probabilities for class 1
+
+# Compute ROC curve & AUC
+roc_knn_tumorPeri <- roc(test_tumorPeriCorr$Mutatie_patogena_prezenta, knn_probabilities_tumorPeri, levels = c("0", "1"), direction = "<")
+auc_knn_tumorPeri <- auc(roc_knn_tumorPeri)
+print(auc_knn_tumorPeri)  # Print the AUC value
+
+# Plot ROC curve
+plot(roc_knn_tumorPeri, col = "blue", lwd = 2, main = "ROC Curve - K-Nearest Neighbours Classifier", legacy.axes = "TRUE")
+
+# --------------------------------------
+# Compute Baseline AUC
+# --------------------------------------
+knn_probabilities_tumorPeri <- predict(knn_model_tumorPeri, test_tumorPeriCorr, type = "prob")[, "1"]
+roc_original_tumorPeri <- roc(test_tumorPeriCorr$Mutatie_patogena_prezenta, knn_probabilities_tumorPeri)
+auc_original_tumorPeri <- auc(roc_original_tumorPeri)
+
+# --------------------------------------
+# Compute Mean Dropout Loss (1 - AUC)
+# --------------------------------------
+features <- c("RadScore2", "KI67.valoare")
+mdl_values <- numeric(length(features))
+
+for (i in seq_along(features)) {
+  test_shuffled <- test_tumorPeriCorr
+  test_shuffled[[features[i]]] <- sample(test_shuffled[[features[i]]])  # Shuffle feature
+  
+  knn_prob_shuffled <- predict(knn_model_tumorPeri, test_shuffled, type = "prob")[, "1"]
+  roc_shuffled <- roc(test_tumorPeriCorr$Mutatie_patogena_prezenta, knn_prob_shuffled)
+  auc_shuffled <- auc(roc_shuffled)
+  
+  mdl_values[i] <- 1 - (auc_shuffled / auc_original_tumorPeri)  # Compute MDL
+}
+
+# --------------------------------------
+# Print and Plot MDL (1 - AUC)
+# --------------------------------------
+mdl_results_tumorPeri <- data.frame(Feature = features, MDL = mdl_values)
+print("Mean Dropout Loss (MDL) - 1 - AUC:")
+print(mdl_results_tumorPeri)
+
+# Plot MDL
+ggplot(mdl_results_tumorPeri, aes(x = Feature, y = MDL, fill = Feature)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Feature Importance (MDL - 1 - AUC)", y = "Mean Dropout Loss (1 - AUC)", x = "Feature") +
+  theme_minimal()
+
+
+##############################################################################################
+
+# --------------------------------------
+# Train SVM for tumorCorr
+# --------------------------------------
+
+##############################################################################################
+
+# Train SVM model on training data
+svm_model <- train(
+  Mutatie_patogena_prezenta ~ RadScore1 + KI67.valoare, 
+  data = train_tumorCorr, 
+  method = "svmRadial",  # Radial Basis Function kernel
+  tuneLength = 10,  # Tries different cost and sigma values to find the best one
+  prob.model = TRUE
+)
+
+# Print model results
+print(svm_model)
+
+# Best hyperparameters
+print(svm_model$bestTune)
+
+# Plot tuning results
+plot(svm_model)
+
+# Predict on **test set**
+svm_predictions <- predict(svm_model, test_tumorCorr)
+
+# Compute confusion matrix
+conf_matrix_svm <- confusionMatrix(svm_predictions, test_tumorCorr$Mutatie_patogena_prezenta, positive = "1")
+print(conf_matrix_svm)
+
+# Get predicted probabilities for the test set
+svm_probs <- predict(svm_model, test_tumorCorr, type = "prob")
+svm_probabilities <- svm_probs[, "1"]  # Extract probabilities for class 1
+
+# Compute ROC curve & AUC
+roc_svm <- roc(test_tumorCorr$Mutatie_patogena_prezenta, svm_probabilities, levels = c("0", "1"), direction = "<")
+auc_svm <- auc(roc_svm)
+print(auc_svm)  # Print the AUC value
+
+# Plot ROC curve
+plot(roc_svm, col = "red", lwd = 2, main = "ROC Curve - SVM (tumorCorr)", legacy.axes = TRUE)
+
+# --------------------------------------
+# Compute Baseline AUC
+# --------------------------------------
+svm_probabilities <- predict(svm_model, test_tumorCorr, type = "prob")[, "1"]
+roc_original_svm <- roc(test_tumorCorr$Mutatie_patogena_prezenta, svm_probabilities)
+auc_original_svm <- auc(roc_original_svm)
+
+# --------------------------------------
+# Compute Mean Dropout Loss (1 - AUC)
+# --------------------------------------
+features <- c("RadScore1", "KI67.valoare")
+mdl_values <- numeric(length(features))
+
+for (i in seq_along(features)) {
+  test_shuffled <- test_tumorCorr
+  test_shuffled[[features[i]]] <- sample(test_shuffled[[features[i]]])  # Shuffle feature
+  
+  svm_prob_shuffled <- predict(svm_model, test_shuffled, type = "prob")[, "1"]
+  roc_shuffled <- roc(test_tumorCorr$Mutatie_patogena_prezenta, svm_prob_shuffled)
+  auc_shuffled <- auc(roc_shuffled)
+  
+  mdl_values[i] <- 1 - (auc_shuffled / auc_original_svm)  # Compute MDL
+}
+
+# --------------------------------------
+# Print and Plot MDL (1 - AUC)
+# --------------------------------------
+mdl_results_svm <- data.frame(Feature = features, MDL = mdl_values)
+print("Mean Dropout Loss (MDL) - 1 - AUC:")
+print(mdl_results_svm)
+
+# Plot MDL
+ggplot(mdl_results_svm, aes(x = Feature, y = MDL, fill = Feature)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Feature Importance (MDL - 1 - AUC)", y = "Mean Dropout Loss (1 - AUC)", x = "Feature") +
+  theme_minimal()
+
+
+##############################################################################################
+
+# --------------------------------------
+# Train SVM for tumorPeriCorr
+# --------------------------------------
+
+##############################################################################################
+
+# Train SVM model on training data for tumorPeriCorr
+svm_model_tumorPeri <- train(
+  Mutatie_patogena_prezenta ~ RadScore2 + KI67.valoare, 
+  data = train_tumorPeriCorr, 
+  method = "svmRadial",  # Radial Basis Function kernel
+  tuneLength = 10,  # Tries different cost and sigma values to find the best one
+  prob.model = TRUE
+)
+
+# Print model results
+print(svm_model_tumorPeri)
+
+# Best hyperparameters
+print(svm_model_tumorPeri$bestTune)
+
+# Plot tuning results
+plot(svm_model_tumorPeri)
+
+# Predict on **test set**
+svm_predictions_tumorPeri <- predict(svm_model_tumorPeri, test_tumorPeriCorr)
+
+# Compute confusion matrix
+conf_matrix_svm_tumorPeri <- confusionMatrix(svm_predictions_tumorPeri, test_tumorPeriCorr$Mutatie_patogena_prezenta, positive = "1")
+print(conf_matrix_svm_tumorPeri)
+
+# Get predicted probabilities for the test set
+svm_probs_tumorPeri <- predict(svm_model_tumorPeri, test_tumorPeriCorr, type = "prob")
+svm_probabilities_tumorPeri <- svm_probs_tumorPeri[, "1"]  # Extract probabilities for class 1
+
+# Compute ROC curve & AUC
+roc_svm_tumorPeri <- roc(test_tumorPeriCorr$Mutatie_patogena_prezenta, svm_probabilities_tumorPeri, levels = c("0", "1"), direction = "<")
+auc_svm_tumorPeri <- auc(roc_svm_tumorPeri)
+print(auc_svm_tumorPeri)  # Print the AUC value
+
+# Plot ROC curve
+plot(roc_svm_tumorPeri, col = "blue", lwd = 2, main = "ROC Curve - Support Vector Machine classifier", legacy.axes = TRUE)
+
+# --------------------------------------
+# Compute Baseline AUC
+# --------------------------------------
+svm_probabilities_tumorPeri <- predict(svm_model_tumorPeri, test_tumorPeriCorr, type = "prob")[, "1"]
+roc_original_svm_tumorPeri <- roc(test_tumorPeriCorr$Mutatie_patogena_prezenta, svm_probabilities_tumorPeri)
+auc_original_svm_tumorPeri <- auc(roc_original_svm_tumorPeri)
+
+# --------------------------------------
+# Compute Mean Dropout Loss (1 - AUC)
+# --------------------------------------
+features <- c("RadScore2", "KI67.valoare")
+mdl_values <- numeric(length(features))
+
+for (i in seq_along(features)) {
+  test_shuffled <- test_tumorPeriCorr
+  test_shuffled[[features[i]]] <- sample(test_shuffled[[features[i]]])  # Shuffle feature
+  
+  svm_prob_shuffled <- predict(svm_model_tumorPeri, test_shuffled, type = "prob")[, "1"]
+  roc_shuffled <- roc(test_tumorPeriCorr$Mutatie_patogena_prezenta, svm_prob_shuffled)
+  auc_shuffled <- auc(roc_shuffled)
+  
+  mdl_values[i] <- 1 - (auc_shuffled / auc_original_svm_tumorPeri)  # Compute MDL
+}
+
+# --------------------------------------
+# Print and Plot MDL (1 - AUC)
+# --------------------------------------
+mdl_results_svm_tumorPeri <- data.frame(Feature = features, MDL = mdl_values)
+print("Mean Dropout Loss (MDL) - 1 - AUC:")
+print(mdl_results_svm_tumorPeri)
+
+# Plot MDL
+ggplot(mdl_results_svm_tumorPeri, aes(x = Feature, y = MDL, fill = Feature)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Feature Importance (MDL - 1 - AUC)", y = "Mean Dropout Loss (1 - AUC)", x = "Feature") +
+  theme_minimal()
+
+
+##############################################################################################
+
+# --------------------------------------------
+# Train Boosting Classification for tumorCorr
+# --------------------------------------------
+
+##############################################################################################
+
+# Ensure the outcome variable is a factor with valid names
+train_tumorCorr$Mutatie_patogena_prezenta <- factor(train_tumorCorr$Mutatie_patogena_prezenta, 
+                                                    levels = c("0", "1"), 
+                                                    labels = c("No", "Yes"))
+
+test_tumorCorr$Mutatie_patogena_prezenta <- factor(test_tumorCorr$Mutatie_patogena_prezenta, 
+                                                   levels = c("0", "1"), 
+                                                   labels = c("No", "Yes"))
+
+# Define training control
+ctrl <- trainControl(
+  method = "cv",       # Cross-validation
+  number = 5,          # 5-fold cross-validation
+  classProbs = TRUE,   # Required for probability predictions
+  summaryFunction = twoClassSummary
+)
+
+# Train Boosting model on training data
+boost_model <- train(
+  Mutatie_patogena_prezenta ~ RadScore1 + KI67.valoare, 
+  data = train_tumorCorr, 
+  method = "gbm",
+  trControl = ctrl,
+  tuneLength = 10,       # Tries 10 different hyperparameter settings
+  metric = "ROC",
+  verbose = FALSE        # Suppress output during training
+)
+
+# Print model results
+print(boost_model)
+
+# Best hyperparameters
+print(boost_model$bestTune)
+
+# Plot tuning results
+plot(boost_model)
+
+# Predict on **test set**
+boost_predictions <- predict(boost_model, test_tumorCorr)
+
+# Compute confusion matrix
+conf_matrix_boost <- confusionMatrix(boost_predictions, test_tumorCorr$Mutatie_patogena_prezenta, positive = "Yes")
+print(conf_matrix_boost)
+
+# Get predicted probabilities for the test set
+boost_probs <- predict(boost_model, test_tumorCorr, type = "prob")
+boost_probabilities <- boost_probs[, "Yes"]  # Extract probabilities for class 1
+
+# Compute ROC curve & AUC
+roc_boost <- roc(test_tumorCorr$Mutatie_patogena_prezenta, boost_probabilities, levels = c("No", "Yes"), direction = "<")
+auc_boost <- auc(roc_boost)
+print(auc_boost)  # Print the AUC value
+
+# Plot ROC curve
+plot(roc_boost, col = "red", lwd = 2, main = "ROC Curve - Boosting classifier", legacy.axes = TRUE)
+
+# --------------------------------------
+# Compute Baseline AUC
+# --------------------------------------
+boost_probabilities <- predict(boost_model, test_tumorCorr, type = "prob")[, "Yes"]
+roc_original_boost <- roc(test_tumorCorr$Mutatie_patogena_prezenta, boost_probabilities)
+auc_original_boost <- auc(roc_original_boost)
+
+# --------------------------------------
+# Compute Mean Dropout Loss (1 - AUC)
+# --------------------------------------
+features <- c("RadScore1", "KI67.valoare")
+mdl_values <- numeric(length(features))
+
+for (i in seq_along(features)) {
+  test_shuffled <- test_tumorCorr
+  test_shuffled[[features[i]]] <- sample(test_shuffled[[features[i]]])  # Shuffle feature
+  
+  boost_prob_shuffled <- predict(boost_model, test_shuffled, type = "prob")[, "Yes"]
+  roc_shuffled <- roc(test_tumorCorr$Mutatie_patogena_prezenta, boost_prob_shuffled)
+  auc_shuffled <- auc(roc_shuffled)
+  
+  mdl_values[i] <- 1 - (auc_shuffled / auc_original_boost)  # Compute MDL
+}
+
+# --------------------------------------
+# Print and Plot MDL (1 - AUC)
+# --------------------------------------
+mdl_results_boost_tumorCorr <- data.frame(Feature = features, MDL = mdl_values)
+print("Mean Dropout Loss (MDL) - 1 - AUC:")
+print(mdl_results_boost_tumorCorr)
+
+# Plot MDL
+ggplot(mdl_results_boost_tumorCorr, aes(x = Feature, y = MDL, fill = Feature)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Feature Importance (MDL - 1 - AUC)", y = "Mean Dropout Loss (1 - AUC)", x = "Feature") +
+  theme_minimal()
+
+
+# ------------------------------------------------
+# Train Boosting Classification for tumorPeriCorr
+# ------------------------------------------------
+
+# Ensure the outcome variable is a factor with valid names
+train_tumorPeriCorr$Mutatie_patogena_prezenta <- factor(train_tumorPeriCorr$Mutatie_patogena_prezenta, 
+                                                        levels = c("0", "1"), 
+                                                        labels = c("No", "Yes"))
+
+test_tumorPeriCorr$Mutatie_patogena_prezenta <- factor(test_tumorPeriCorr$Mutatie_patogena_prezenta, 
+                                                       levels = c("0", "1"), 
+                                                       labels = c("No", "Yes"))
+
+# Train Boosting model on training data
+boost_model_tumorPeri <- train(
+  Mutatie_patogena_prezenta ~ RadScore2 + KI67.valoare, 
+  data = train_tumorPeriCorr, 
+  method = "gbm",  
+  trControl = ctrl,
+  tuneLength = 10,
+  metric = "ROC",
+  verbose = FALSE
+)
+
+# Print model results
+print(boost_model_tumorPeri)
+
+# Best tuning parameters
+print(boost_model_tumorPeri$bestTune)
+
+# Predict on **test set**
+boost_predictions_tumorPeri <- predict(boost_model_tumorPeri, test_tumorPeriCorr)
+
+# Compute confusion matrix
+conf_matrix_boost_tumorPeri <- confusionMatrix(boost_predictions_tumorPeri, test_tumorPeriCorr$Mutatie_patogena_prezenta, positive = "Yes")
+print(conf_matrix_boost_tumorPeri)
+
+# Get predicted probabilities for the test set
+boost_probs_tumorPeri <- predict(boost_model_tumorPeri, test_tumorPeriCorr, type = "prob")
+boost_probabilities_tumorPeri <- boost_probs_tumorPeri[, "Yes"]  # Extract probabilities for class "Yes"
+
+# Compute ROC curve & AUC
+roc_boost_tumorPeri <- roc(test_tumorPeriCorr$Mutatie_patogena_prezenta, boost_probabilities_tumorPeri, levels = c("No", "Yes"), direction = "<")
+auc_boost_tumorPeri <- auc(roc_boost_tumorPeri)
+print(auc_boost_tumorPeri)  # Print the AUC value
+
+# Plot ROC curve
+plot(roc_boost_tumorPeri, col = "blue", lwd = 2, main = "ROC Curve - Boosting (tumorPeriCorr)", legacy.axes = "TRUE")
+
+# --------------------------------------
+# Compute Baseline AUC
+# --------------------------------------
+boost_probabilities_tumorPeri <- predict(boost_model_tumorPeri, test_tumorPeriCorr, type = "prob")[, "Yes"]
+roc_original_boost_tumorPeri <- roc(test_tumorPeriCorr$Mutatie_patogena_prezenta, boost_probabilities_tumorPeri)
+auc_original_boost_tumorPeri <- auc(roc_original_boost_tumorPeri)
+
+# --------------------------------------
+# Compute Mean Dropout Loss (1 - AUC)
+# --------------------------------------
+features <- c("RadScore2", "KI67.valoare")
+mdl_values <- numeric(length(features))
+
+for (i in seq_along(features)) {
+  test_shuffled <- test_tumorPeriCorr
+  test_shuffled[[features[i]]] <- sample(test_shuffled[[features[i]]])  # Shuffle feature
+  
+  boost_prob_shuffled <- predict(boost_model_tumorPeri, test_shuffled, type = "prob")[, "Yes"]
+  roc_shuffled <- roc(test_tumorPeriCorr$Mutatie_patogena_prezenta, boost_prob_shuffled)
+  auc_shuffled <- auc(roc_shuffled)
+  
+  mdl_values[i] <- 1 - (auc_shuffled / auc_original_boost_tumorPeri)  # Compute MDL
+}
+
+# --------------------------------------
+# Print and Plot MDL (1 - AUC)
+# --------------------------------------
+mdl_results_boost_tumorPeri <- data.frame(Feature = features, MDL = mdl_values)
+print("Mean Dropout Loss (MDL) - 1 - AUC:")
+print(mdl_results_boost_tumorPeri)
+
+# Plot MDL
+ggplot(mdl_results_boost_tumorPeri, aes(x = Feature, y = MDL, fill = Feature)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Feature Importance (MDL - 1 - AUC)", y = "Mean Dropout Loss (1 - AUC)", x = "Feature") +
+  theme_minimal()
+
